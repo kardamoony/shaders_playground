@@ -1,0 +1,221 @@
+#pragma kernel CSMain
+
+struct Vertex
+{
+    float3 position;
+    float3 normal;
+    float2 uv;
+};
+
+struct ObjectInstance
+{
+    float4x4 TRSMatrix;
+    float variation;
+};
+
+AppendStructuredBuffer<ObjectInstance> _Instances;
+
+StructuredBuffer<Vertex> _TargetVertices;
+StructuredBuffer<uint> _TargetIndices;
+
+uint _TargetTriangleCount;
+float4x4 _TargetTRSMatrix;
+
+Texture2D<float> _PlacementMap;
+SamplerState linearClampSampler;
+
+//TODO: vary scale
+float _ObjScale;
+int _Density;
+
+float3 _CameraPosition;
+float4 _CameraFrustumPlanes[6];
+
+//32-bit PCG hash by Jarzynski and Olano
+//Source -- https://www.reedbeta.com/blog/hash-functions-for-gpu-rendering/
+uint pcg_hash(uint input)
+{
+    uint state = input * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float Random(uint seed)
+{
+    return float(pcg_hash(seed)) / 4294967295.0; //uint.MaxValue
+}
+
+void RandomInTriangle(Vertex v0, Vertex v1, Vertex v2, float2 random, out float3 position, out float3 normal, out float2 uv)
+{
+    if (random.x + random.y > 1)
+    {
+        random = float2(1 - random.x, 1 - random.y);
+    }
+
+    float a = 1 - random.x - random.y;
+    float b = random.x;
+    float c = random.y;
+
+    position = a * v0.position + b * v1.position + c * v2.position;
+    normal = a * v0.normal + b * v1.normal + c * v2.normal;
+    uv = a * v0.uv + b * v1.uv + c * v2.uv;
+}
+
+void CenterInTriangle(Vertex v0, Vertex v1, Vertex v2, out float3 position, out float3 normal, out float2 uv)
+{
+    position = (v0.position + v1.position + v2.position) * 0.3333f;
+    normal = normalize(v0.normal + v1.normal + v2.normal) * 0.3333f;
+    uv = (v0.uv + v1.uv + v2.uv) * 0.3333f;
+}
+
+float3x3 LookRotation(float3 forward, float3 up)
+{
+    forward = normalize(forward);
+    up = normalize(up);
+    float3 right = normalize(cross(up, forward));
+    up = normalize(cross(forward, right));
+
+    return float3x3(
+        right.x, up.x, forward.x,
+        right.y, up.y, forward.y,
+        right.z, up.z, forward.z);
+}
+
+float3x3 RotateAroundAxis(float3 axis, float angle)
+{
+    float sin;
+    float cos;
+    
+    sincos(angle, sin, cos);
+
+    float oneMinusCos = 1 - cos;
+
+    return float3x3(
+        cos + axis.x * axis.x * oneMinusCos, axis.x * axis.y * oneMinusCos - axis.z * sin, axis.x * axis.z * oneMinusCos + axis.y * sin,
+        axis.y * axis.x * oneMinusCos + axis.z * sin, cos + axis.y * axis.y * oneMinusCos, axis.y * axis.z * oneMinusCos - axis.x * sin,
+        axis.z * axis.x * oneMinusCos - axis.y * sin, axis.z * axis.y * oneMinusCos + axis.x * sin, cos + axis.z * axis.z * oneMinusCos
+        );
+}
+
+float4x4 GetTRSMatrix(float3 pos, float3 forward, float3 normal, float scale, float rotation)
+{
+    float3x3 rot = mul(RotateAroundAxis(normal, rotation), LookRotation(forward, normal));
+    
+    return float4x4(
+        float4(rot[0] * scale, pos.x),
+        float4(rot[1] * scale, pos.y),
+        float4(rot[2] * scale, pos.z),
+        float4(0, 0, 0, 1)
+        );
+}
+
+bool IsOutOfFrustum(in float3 position)
+{
+    //TODO: to parameter
+    const float offset = -0.1;
+    
+    for (int i = 0; i < 5; ++i)
+    {
+        float3 normal = _CameraFrustumPlanes[i].xyz;
+        float distance = _CameraFrustumPlanes[i].w;
+        
+        if (offset - dot(position, normal) > distance) return true;
+    }
+
+    return false;
+}
+
+float GetTriangleArea(in float3 position0, in float3 position1, in float3 position2)
+{
+    float3 ab = position1 - position0;
+    float3 ac = position2 - position0;
+    return length(cross(ab, ac)) * 0.5;
+}
+
+float3 GetWeights(in float3 a, in float3 b, in float3 c, in float3 pos)
+{
+    float3 v0 = b - a;
+    float3 v1 = c - a;
+    float3 v2 = pos - a;
+
+    float d00 = dot(v0, v0);
+    float d01 = dot(v0, v1);
+    float d11 = dot(v1, v1);
+    float d20 = dot(v2, v0);
+    float d21 = dot(v2, v1);
+
+    float denom = d00 * d11 - d01 * d01;
+    
+    float x = (d11 * d20 - d01 * d21) / denom;
+    float y = (d00 * d21 - d01 * d20) / denom;
+    float z = 1 - x - y;
+
+    return float3(x, y, z);
+}
+
+void GenerateOnTriangle(in Vertex v0, in Vertex v1, in Vertex v2, uint seed0, uint seed1, in float probability)
+{
+    float2 random = float2(Random(seed0), Random(seed1));
+
+    if (random.x < 1 - probability) return;
+
+    float3 position;
+    float3 normal;
+    float2 uv;
+    
+    RandomInTriangle(v0, v1, v2, random, position, normal, uv);
+
+    float scale = _ObjScale * _PlacementMap.SampleLevel(linearClampSampler, uv, 0);
+
+    if (IsOutOfFrustum(position) || scale < 0.01) return;
+
+    float rotation = random.y * 6.28;
+
+    float4x4 trsMatrix = GetTRSMatrix(position, v1.position - v0.position, normal, scale, rotation);
+
+    ObjectInstance obj;
+    obj.variation = random.y;
+    obj.TRSMatrix = trsMatrix;
+
+    _Instances.Append(obj);
+}
+
+Vertex TransformVertex(Vertex vertex)
+{
+    vertex.position = mul(_TargetTRSMatrix, float4(vertex.position, 1)).xyz;
+    vertex.normal = normalize(mul(_TargetTRSMatrix, float4(vertex.normal, 0))).xyz;
+    return vertex;
+}
+
+[numthreads(64,1,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _TargetTriangleCount) return;
+
+    int index = id.x * 3;
+
+    Vertex v0 = _TargetVertices[_TargetIndices[index]];
+    Vertex v1 = _TargetVertices[_TargetIndices[index + 1]];
+    Vertex v2 = _TargetVertices[_TargetIndices[index + 2]];
+
+    v0 = TransformVertex(v0);
+    v1 = TransformVertex(v1);
+    v2 = TransformVertex(v2);
+
+    float area = GetTriangleArea(v0.position, v1.position, v2.position);
+
+    float3 triangleCenter = (v0.position + v1.position + v2.position) * 0.333f;
+    float distanceToCamera = distance(triangleCenter, _CameraPosition);
+
+    const float minDistance = 5;
+    const float maxDistance = 20;
+
+    float density = saturate(1 - (distanceToCamera - minDistance) / (maxDistance - minDistance));
+    
+    float count = _Density * area * density * density;
+    
+    for (int i = 0; i < count; i++)
+    {
+        GenerateOnTriangle(v0, v1, v2, asuint(index + i), asuint(index + i + 1), 0.5);
+    }
+}
