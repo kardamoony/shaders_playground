@@ -20,11 +20,13 @@ namespace Rendering
         private static readonly int CameraPositionProperty = Shader.PropertyToID("_CameraPosition");
         private static readonly int CameraFrustumProperty = Shader.PropertyToID("_CameraFrustumPlanes");
         private static readonly int PlacementMapProperty = Shader.PropertyToID("_PlacementMap");
+        private static readonly int CameraDistanceProperty = Shader.PropertyToID("_CameraCloseFar");
         
         [SerializeField] private ComputeShader _computeShader;
         [SerializeField] private float _scale = 1f;
         [SerializeField] private int _density = 1;
         [SerializeField] private Texture2D _placementMap;
+        [SerializeField] private Vector2 _cameraDistanceLimits = new Vector2(10, 50);
 
         private ComputeBuffer _vertsBuffer;
         private ComputeBuffer _indicesBuffer;
@@ -85,6 +87,7 @@ namespace Rendering
             
             _computeShader.SetVector(CameraPositionProperty, camera.transform.position);
             _computeShader.SetVectorArray(CameraFrustumProperty, _frustumArray);
+            _computeShader.SetVector(CameraDistanceProperty, _cameraDistanceLimits);
 
             buffer.Buffer.SetCounterValue(0);
             _computeShader.Dispatch(_kernel, Mathf.CeilToInt(triangles / 64f), 1, 1);
